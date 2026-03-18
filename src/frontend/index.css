@@ -1,0 +1,179 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/assets/fonts/JetBrainsMono.woff2') format('woff2');
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Bricolage Grotesque';
+  src: url('/assets/fonts/BricolageGrotesque.woff2') format('woff2');
+  font-weight: 200 800;
+  font-display: swap;
+}
+
+@layer base {
+  :root {
+    --radius: 0.25rem;
+
+    /* ── Depth-layered dark IDE palette ─────────────────────────────────────
+       Layer 0 (deepest): editor canvas         0.07
+       Layer 1: tab bar / header                0.10
+       Layer 2: sidebar / output panel          0.145
+       Layer 3: popover / dropdown              0.18
+       Surface separation is intentional & perceptible at every boundary.
+    ─────────────────────────────────────────────────────────────────────── */
+
+    --background:    0.115 0.006 240;   /* active tab bg — lighter than tabbar */
+    --foreground:    0.91 0.006 240;
+
+    --card:          0.145 0.008 240;
+    --card-foreground: 0.91 0.006 240;
+
+    --popover:       0.18 0.01 240;
+    --popover-foreground: 0.91 0.006 240;
+
+    /* Teal/cyan primary */
+    --primary:             0.76 0.14 190;
+    --primary-foreground:  0.07 0 0;
+
+    --secondary:           0.20 0.008 240;
+    --secondary-foreground: 0.75 0.006 240;
+
+    --muted:               0.18 0.008 240;
+    --muted-foreground:    0.52 0.012 240;
+
+    --accent:              0.22 0.012 240;
+    --accent-foreground:   0.91 0.006 240;
+
+    --destructive:         0.60 0.22 27;
+    --destructive-foreground: 0.98 0 0;
+
+    /* Slightly more visible borders — key for panel separation */
+    --border:              0.26 0.012 240;
+    --input:               0.22 0.01 240;
+    --ring:                0.76 0.14 190;
+
+    /* ── Panel surface tokens ─────────────────────────────────────────── */
+    --editor-bg:      0.07 0 0;          /* darkest — the code canvas */
+    --sidebar-bg:     0.145 0.008 240;   /* lightest panel — clearly distinct */
+    --tabbar-bg:      0.10 0.004 240;    /* mid: sits between editor & sidebar */
+    --header-bg:      0.115 0.01 240;    /* header: elevated above tabbar */
+    --statusbar-bg:   0.062 0.005 240;   /* deepest chrome — grounds the layout */
+
+    /* ── File type accent colors ─────────────────────────────────────── */
+    --html-color: 0.74 0.18 42;
+    --css-color:  0.70 0.16 238;
+    --js-color:   0.86 0.16 92;
+
+    --chart-1: 0.76 0.14 190;
+    --chart-2: 0.70 0.18 145;
+    --chart-3: 0.65 0.20 60;
+    --chart-4: 0.72 0.20 280;
+    --chart-5: 0.68 0.22 30;
+
+    --sidebar:                  var(--sidebar-bg);
+    --sidebar-foreground:       0.91 0.006 240;
+    --sidebar-primary:          0.76 0.14 190;
+    --sidebar-primary-foreground: 0.07 0 0;
+    --sidebar-accent:           0.22 0.012 240;
+    --sidebar-accent-foreground: 0.91 0.006 240;
+    --sidebar-border:           0.26 0.012 240;
+    --sidebar-ring:             0.76 0.14 190;
+  }
+
+  * {
+    @apply border-border;
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+  }
+
+  code, pre, textarea.code-area, .code-font {
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+  }
+
+  textarea {
+    resize: none;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: oklch(0.32 0.008 240);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(0.42 0.012 240);
+  }
+}
+
+@layer utilities {
+  .ide-panel {
+    background: oklch(var(--editor-bg));
+  }
+
+  .ide-sidebar {
+    background: oklch(var(--sidebar-bg));
+  }
+
+  .ide-tabbar {
+    background: oklch(var(--tabbar-bg));
+  }
+
+  .ide-header {
+    background: oklch(var(--header-bg));
+  }
+
+  .ide-statusbar {
+    background: oklch(var(--statusbar-bg));
+  }
+
+  /* Active editor tab — explicitly lighter than the tab bar */
+  .tab-active {
+    background: oklch(var(--background));
+  }
+
+  .text-html { color: oklch(var(--html-color)); }
+  .text-css  { color: oklch(var(--css-color));  }
+  .text-js   { color: oklch(var(--js-color));   }
+
+  .bg-html\/10 { background: oklch(var(--html-color) / 0.10); }
+  .bg-css\/10  { background: oklch(var(--css-color)  / 0.10); }
+  .bg-js\/10   { background: oklch(var(--js-color)   / 0.10); }
+
+  /* CTA glow — used on the primary Combine button */
+  .btn-glow {
+    box-shadow: 0 0 14px oklch(0.76 0.14 190 / 0.35),
+                0 1px 3px oklch(0 0 0 / 0.4);
+  }
+  .btn-glow:hover {
+    box-shadow: 0 0 22px oklch(0.76 0.14 190 / 0.55),
+                0 1px 4px oklch(0 0 0 / 0.5);
+  }
+
+  /* Panel inset shadow — gives editor a sunken "active work area" feel */
+  .panel-inset {
+    box-shadow: inset 2px 0 8px oklch(0 0 0 / 0.25);
+  }
+}
