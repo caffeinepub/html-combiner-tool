@@ -7,10 +7,56 @@ function ensureDoctype(html: string): string {
   return html;
 }
 
-function extractBodyContent(html: string): string {
+interface ParsedPage {
+  name: string;
+  title: string;
+  headExtra: string; // <meta>, <link>, etc. (no style/script)
+  bodyContent: string;
+}
+
+// ── Parse cache ────────────────────────────────────────────────────────────
+// Keyed by "name\x00content" to skip re-parsing unchanged HTML files.
+const parseCache = new Map<string, ParsedPage>();
+
+function parsePage(name: string, html: string): ParsedPage {
+  const cacheKey = `${name}\x00${html}`;
+  const cached = parseCache.get(cacheKey);
+  if (cached) return cached;
+
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
-  return doc.body ? doc.body.innerHTML.trim() : html.trim();
+
+  const title =
+    doc.querySelector("title")?.textContent?.trim() ||
+    name.replace(/\.html?$/i, "");
+
+  // Collect head extras (meta, link) but not title/style/script
+  const headExtra = Array.from(doc.head.children)
+    .filter(
+      (el) => !["TITLE", "STYLE", "SCRIPT"].includes(el.tagName.toUpperCase()),
+    )
+    .map((el) => el.outerHTML)
+    .join("\n    ");
+
+  const bodyContent = doc.body ? doc.body.innerHTML.trim() : "";
+
+  const page: ParsedPage = { name, title, headExtra, bodyContent };
+  parseCache.set(cacheKey, page);
+
+  // Keep cache bounded to avoid memory bloat on very large sessions
+  if (parseCache.size > 200) {
+    const firstKey = parseCache.keys().next().value;
+    if (firstKey !== undefined) parseCache.delete(firstKey);
+  }
+
+  return page;
+}
+
+function slugify(name: string): string {
+  return name
+    .replace(/\.html?$/i, "")
+    .replace(/[^a-z0-9]+/gi, "-")
+    .toLowerCase();
 }
 
 export function combineHTML(
@@ -18,23 +64,23 @@ export function combineHTML(
   cssFiles: SourceFile[],
   jsFiles: SourceFile[],
 ): string {
-  // Build combined CSS
+  // ── CSS ────────────────────────────────────────────────────────────────
   const combinedCss = cssFiles
-    .map((f) => `/* === source: ${f.name} === */\n${f.content.trim()}`)
+    .map((f) => `/* === ${f.name} === */\n${f.content.trim()}`)
     .join("\n\n");
 
-  // Build combined JS
+  // ── JS ─────────────────────────────────────────────────────────────────
   const combinedJs = jsFiles
-    .map((f) => `// === source: ${f.name} ===\n${f.content.trim()}`)
+    .map((f) => `// === ${f.name} ===\n${f.content.trim()}`)
     .join("\n\n");
 
-  // No HTML files — scaffold minimal document
+  // ── No HTML: minimal scaffold ──────────────────────────────────────────
   if (htmlFiles.length === 0) {
     const styleBlock = combinedCss
-      ? `\n    <style>\n${combinedCss}\n    </style>`
+      ? `\n    <style>\n${indent(combinedCss, 6)}\n    </style>`
       : "";
     const scriptBlock = combinedJs
-      ? `\n    <script>\n${combinedJs}\n    <\/script>`
+      ? `\n    <script>\n${indent(combinedJs, 6)}\n    <\/script>`
       : "";
     return `<!DOCTYPE html>
 <html lang="en">
@@ -48,54 +94,149 @@ export function combineHTML(
 </html>`;
   }
 
-  // Use first file as parent shell
-  let result = htmlFiles[0].content.trim();
+  // ── Single HTML file: classic inline merge ─────────────────────────────
+  if (htmlFiles.length === 1) {
+    let result = ensureDoctype(htmlFiles[0].content.trim());
 
-  // Append secondary HTML files as sections
-  const secondarySections = htmlFiles
-    .slice(1)
-    .map((f) => {
-      const bodyContent = extractBodyContent(f.content);
-      return `<section data-source="${f.name}">\n${bodyContent}\n</section>`;
-    })
-    .join("\n");
+    if (combinedCss) {
+      const styleTag = `<style>\n${combinedCss}\n</style>`;
+      if (/<\/head>/i.test(result))
+        result = result.replace(/<\/head>/i, `${styleTag}\n</head>`);
+      else result += `\n${styleTag}`;
+    }
 
-  // Inject secondary sections before </body> (we'll do it together with JS injection)
-  const sectionsAndScript = [
-    secondarySections,
-    combinedJs ? `<script>\n${combinedJs}\n<\/script>` : "",
+    if (combinedJs) {
+      const scriptTag = `<script>\n${combinedJs}\n<\/script>`;
+      if (/<\/body>/i.test(result))
+        result = result.replace(/<\/body>/i, `${scriptTag}\n</body>`);
+      else result += `\n${scriptTag}`;
+    }
+
+    return result;
+  }
+
+  // ── Multiple HTML files: SPA page router ──────────────────────────────
+  const pages: ParsedPage[] = htmlFiles.map((f) =>
+    parsePage(f.name, f.content),
+  );
+  const pageIds = pages.map((p) => slugify(p.name));
+
+  // Collect unique head extras across all pages
+  const allHeadExtra = [
+    ...new Set(
+      pages.flatMap((p) => p.headExtra.split("\n").map((l) => l.trim())),
+    ),
   ]
     .filter(Boolean)
+    .join("\n    ");
+
+  // Build nav links
+  const navLinks = pages
+    .map(
+      (p, i) =>
+        `<a href="#" data-page="${pageIds[i]}" class="__nav-link${i === 0 ? " __active" : ""}">` +
+        `${p.title}</a>`,
+    )
+    .join("\n        ");
+
+  // Build page divs
+  const pageDivs = pages
+    .map(
+      (p, i) =>
+        `<div id="__page-${pageIds[i]}" class="__page" ${i !== 0 ? 'style="display:none"' : ""} data-title="${p.title}">\n${indent(p.bodyContent, 8)}\n      </div>`,
+    )
+    .join("\n      ");
+
+  // Built-in router CSS + nav CSS
+  const routerCss = `
+    /* ── HTML Combiner: SPA Router ── */
+    :root { --nav-bg: #1e1e2e; --nav-link: #cdd6f4; --nav-active: #89b4fa; --nav-border: #313244; }
+    .__nav {
+      display: flex; flex-wrap: wrap; gap: 4px;
+      padding: 10px 16px;
+      background: var(--nav-bg);
+      border-bottom: 1px solid var(--nav-border);
+      position: sticky; top: 0; z-index: 9999;
+    }
+    .__nav-link {
+      padding: 5px 14px; border-radius: 6px;
+      font: 600 13px/1 system-ui, sans-serif;
+      color: var(--nav-link); text-decoration: none;
+      background: transparent; border: 1px solid transparent;
+      cursor: pointer; transition: background 0.15s, color 0.15s;
+    }
+    .__nav-link:hover { background: rgba(137,180,250,.12); }
+    .__nav-link.__active {
+      background: rgba(137,180,250,.18);
+      border-color: var(--nav-active);
+      color: var(--nav-active);
+    }`.trimStart();
+
+  // Built-in router JS
+  const routerJs = `
+    /* ── HTML Combiner: SPA Router ── */
+    (function () {
+      var pages = document.querySelectorAll('.__page');
+      var links = document.querySelectorAll('.__nav-link');
+      function show(id) {
+        pages.forEach(function (p) {
+          p.style.display = p.id === '__page-' + id ? '' : 'none';
+        });
+        links.forEach(function (a) {
+          a.classList.toggle('__active', a.dataset.page === id);
+        });
+        document.title = (document.querySelector('#__page-' + id) || {}).dataset.title || document.title;
+        history.replaceState(null, '', '#' + id);
+      }
+      links.forEach(function (a) {
+        a.addEventListener('click', function (e) {
+          e.preventDefault();
+          show(a.dataset.page);
+        });
+      });
+      // Deep-link on load
+      var hash = location.hash.replace('#', '');
+      var ids = Array.from(pages).map(function (p) { return p.id.replace('__page-', ''); });
+      if (hash && ids.includes(hash)) show(hash);
+    })();`.trimStart();
+
+  const userCssBlock = combinedCss
+    ? `\n    /* ── User CSS ── */\n    ${combinedCss.split("\n").join("\n    ")}`
+    : "";
+
+  const userJsBlock = combinedJs
+    ? `\n    /* ── User JS ── */\n    ${combinedJs.split("\n").join("\n    ")}`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${pages[0].title}</title>
+    ${allHeadExtra}
+    <style>
+    ${routerCss}${userCssBlock}
+    </style>
+  </head>
+  <body>
+    <nav class="__nav">
+        ${navLinks}
+    </nav>
+    <div id="__pages">
+      ${pageDivs}
+    </div>
+    <script>
+    ${routerJs}${userJsBlock}
+    <\/script>
+  </body>
+</html>`;
+}
+
+function indent(str: string, spaces: number): string {
+  const pad = " ".repeat(spaces);
+  return str
+    .split("\n")
+    .map((l) => (l.trim() ? pad + l : l))
     .join("\n");
-
-  // Ensure DOCTYPE
-  result = ensureDoctype(result);
-
-  // Inject CSS into <head>
-  if (combinedCss) {
-    const styleTag = `<style>\n${combinedCss}\n</style>`;
-    if (/<\/head>/i.test(result)) {
-      result = result.replace(/<\/head>/i, `${styleTag}\n</head>`);
-    } else if (/<head[^>]*>/i.test(result)) {
-      result = result.replace(/(<head[^>]*>)/i, `$1\n${styleTag}`);
-    } else if (/<html[^>]*>/i.test(result)) {
-      result = result.replace(
-        /(<html[^>]*>)/i,
-        `$1\n<head>\n${styleTag}\n</head>`,
-      );
-    } else {
-      result = `<head>\n${styleTag}\n</head>\n${result}`;
-    }
-  }
-
-  // Inject sections + JS before </body>
-  if (sectionsAndScript) {
-    if (/<\/body>/i.test(result)) {
-      result = result.replace(/<\/body>/i, `${sectionsAndScript}\n</body>`);
-    } else {
-      result = `${result}\n${sectionsAndScript}`;
-    }
-  }
-
-  return result;
 }

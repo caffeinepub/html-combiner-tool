@@ -9,8 +9,10 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  PackageOpen,
   Plus,
   Trash2,
+  UploadCloud,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -23,6 +25,10 @@ interface FileExplorerProps {
   onRenameNode: (id: string, newName: string) => void;
   onAddFile: (parentId: string, language: FileLanguage) => void;
   onAddFolder: (parentId: string | null) => void;
+  onUploadFiles: (files: FileList) => void;
+  onReorderNodes: (draggedId: string, targetId: string) => void;
+  onExportZip: () => void;
+  onImportZip: (file: File) => void;
 }
 
 function FileIcon({ language }: { language?: FileLanguage }) {
@@ -33,6 +39,24 @@ function FileIcon({ language }: { language?: FileLanguage }) {
   if (language === "js")
     return <FileText className="w-3.5 h-3.5 text-js shrink-0" />;
   return <FileText className="w-3.5 h-3.5 text-muted-foreground shrink-0" />;
+}
+
+interface DropIndicatorProps {
+  visible: boolean;
+  depth: number;
+}
+function DropIndicator({ visible, depth }: DropIndicatorProps) {
+  if (!visible) return null;
+  return (
+    <div
+      className="h-[2px] mx-1 rounded-full pointer-events-none"
+      style={{
+        marginLeft: `${8 + depth * 12}px`,
+        background: "oklch(0.76 0.14 190)",
+        boxShadow: "0 0 6px oklch(0.76 0.14 190 / 0.5)",
+      }}
+    />
+  );
 }
 
 interface TreeNodeProps {
@@ -48,6 +72,12 @@ interface TreeNodeProps {
   onRenameNode: (id: string, newName: string) => void;
   onAddFile: (parentId: string, language: FileLanguage) => void;
   nodeIndex: number;
+  draggedId: string | null;
+  dropTargetId: string | null;
+  onDragStart: (id: string) => void;
+  onDragOver: (e: React.DragEvent, id: string) => void;
+  onDrop: (e: React.DragEvent, id: string) => void;
+  onDragEnd: () => void;
 }
 
 function TreeNode({
@@ -63,6 +93,12 @@ function TreeNode({
   onRenameNode,
   onAddFile,
   nodeIndex,
+  draggedId,
+  dropTargetId,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd,
 }: TreeNodeProps) {
   const [isHovered, setIsHovered] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
@@ -98,6 +134,8 @@ function TreeNode({
   const isExpanded = expandedFolders.has(node.id);
   const isActive = node.id === activeFileId;
   const isOpen = openTabIds.includes(node.id);
+  const isDragging = draggedId === node.id;
+  const isDropTarget = dropTargetId === node.id;
 
   const handleRenameSubmit = () => {
     if (renameValue.trim() && renameValue !== node.name) {
@@ -118,9 +156,33 @@ function TreeNode({
 
   return (
     <div>
+      {/* Drop indicator ABOVE this node */}
+      <DropIndicator visible={isDropTarget} depth={depth} />
+
       <div
         data-ocid={ocid}
-        className={`group flex items-center gap-1 px-2 py-[3px] cursor-pointer rounded-sm mx-1 transition-colors relative ${
+        draggable
+        onDragStart={(e) => {
+          e.dataTransfer.setData("application/x-file-node-id", node.id);
+          e.dataTransfer.effectAllowed = "move";
+          onDragStart(node.id);
+        }}
+        onDragOver={(e) => {
+          if (e.dataTransfer.types.includes("application/x-file-node-id")) {
+            e.preventDefault();
+            onDragOver(e, node.id);
+          }
+        }}
+        onDrop={(e) => {
+          if (e.dataTransfer.types.includes("application/x-file-node-id")) {
+            e.preventDefault();
+            onDrop(e, node.id);
+          }
+        }}
+        onDragEnd={onDragEnd}
+        className={`group flex items-center gap-1 px-2 py-[3px] cursor-pointer rounded-sm mx-1 transition-all relative ${
+          isDragging ? "opacity-40" : ""
+        } ${
           isActive
             ? "bg-accent text-foreground"
             : isOpen
@@ -261,6 +323,12 @@ function TreeNode({
               onRenameNode={onRenameNode}
               onAddFile={onAddFile}
               nodeIndex={idx + 1}
+              draggedId={draggedId}
+              dropTargetId={dropTargetId}
+              onDragStart={onDragStart}
+              onDragOver={onDragOver}
+              onDrop={onDrop}
+              onDragEnd={onDragEnd}
             />
           ))}
         </div>
@@ -278,10 +346,19 @@ export function FileExplorer({
   onRenameNode,
   onAddFile,
   onAddFolder,
+  onUploadFiles,
+  onReorderNodes,
+  onExportZip,
+  onImportZip,
 }: FileExplorerProps) {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     () => new Set(files.filter((f) => f.type === "folder").map((f) => f.id)),
   );
+  const [isDragging, setIsDragging] = useState(false);
+  const [draggedId, setDraggedId] = useState<string | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const zipImportRef = useRef<HTMLInputElement>(null);
 
   const toggleFolder = (id: string) => {
     setExpandedFolders((prev) => {
@@ -305,20 +382,150 @@ export function FileExplorer({
     .filter((f) => f.parentId === null)
     .sort((a, b) => a.order - b.order);
 
+  const handleOsFileDragOver = (e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes("Files")) {
+      e.preventDefault();
+      setIsDragging(true);
+    }
+  };
+
+  const handleOsFileDragLeave = (e: React.DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragging(false);
+    }
+  };
+
+  const handleOsFileDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files.length > 0) {
+      onUploadFiles(e.dataTransfer.files);
+    }
+  };
+
+  const handleInternalDragStart = (id: string) => {
+    setDraggedId(id);
+    setDropTargetId(null);
+  };
+
+  const handleInternalDragOver = (_e: React.DragEvent, id: string) => {
+    if (draggedId && id !== draggedId) {
+      // Only allow reorder within same parent
+      const dragged = files.find((f) => f.id === draggedId);
+      const target = files.find((f) => f.id === id);
+      if (dragged && target && dragged.parentId === target.parentId) {
+        setDropTargetId(id);
+      }
+    }
+  };
+
+  const handleInternalDrop = (e: React.DragEvent, targetId: string) => {
+    const sourceId = e.dataTransfer.getData("application/x-file-node-id");
+    if (sourceId && sourceId !== targetId) {
+      onReorderNodes(sourceId, targetId);
+    }
+    setDraggedId(null);
+    setDropTargetId(null);
+  };
+
+  const handleDragEnd = () => {
+    setDraggedId(null);
+    setDropTargetId(null);
+  };
+
   return (
-    <div className="ide-sidebar h-full flex flex-col border-r border-border">
+    <div
+      className={`ide-sidebar h-full flex flex-col border-r transition-all duration-150 ${
+        isDragging
+          ? "border-primary/60 ring-1 ring-inset ring-primary/40"
+          : "border-border"
+      }`}
+      onDragOver={handleOsFileDragOver}
+      onDragLeave={handleOsFileDragLeave}
+      onDrop={handleOsFileDrop}
+    >
+      {/* Hidden file inputs */}
+      <input
+        ref={uploadInputRef}
+        type="file"
+        multiple
+        accept=".html,.css,.js"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            onUploadFiles(e.target.files);
+          }
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={zipImportRef}
+        type="file"
+        accept=".zip"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) onImportZip(file);
+          e.target.value = "";
+        }}
+      />
+
+      {/* OS file drag overlay */}
+      {isDragging && (
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-primary/5 border-2 border-dashed border-primary/50 rounded-sm pointer-events-none">
+          <UploadCloud className="w-8 h-8 text-primary/60 mb-1" />
+          <p className="text-xs text-primary/70 code-font">Drop files here</p>
+        </div>
+      )}
+
+      {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
         <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
           Explorer
         </span>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            data-ocid="sidebar.upload_button"
+            onClick={() => uploadInputRef.current?.click()}
+            className="w-5 h-5 flex items-center justify-center rounded hover:bg-accent text-muted-foreground/50 hover:text-primary transition-colors"
+            title="Upload files (.html/.css/.js)"
+          >
+            <UploadCloud className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            data-ocid="sidebar.button"
+            onClick={() => onAddFolder(null)}
+            className="w-5 h-5 flex items-center justify-center rounded hover:bg-accent text-muted-foreground/50 hover:text-primary transition-colors"
+            title="New folder"
+          >
+            <FolderPlus className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* ZIP Import / Export row */}
+      <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border/60">
         <button
           type="button"
-          data-ocid="sidebar.button"
-          onClick={() => onAddFolder(null)}
-          className="w-5 h-5 flex items-center justify-center rounded hover:bg-accent text-muted-foreground/50 hover:text-primary transition-colors"
-          title="New folder"
+          data-ocid="sidebar.export_button"
+          onClick={onExportZip}
+          className="flex items-center gap-1 flex-1 justify-center h-[22px] rounded text-[10px] code-font font-medium border border-border/60 text-muted-foreground/50 hover:text-foreground hover:border-border transition-colors"
+          title="Export project as ZIP"
         >
-          <FolderPlus className="w-3.5 h-3.5" />
+          <PackageOpen className="w-3 h-3" />
+          Export ZIP
+        </button>
+        <button
+          type="button"
+          data-ocid="sidebar.import_button"
+          onClick={() => zipImportRef.current?.click()}
+          className="flex items-center gap-1 flex-1 justify-center h-[22px] rounded text-[10px] code-font font-medium border border-border/60 text-muted-foreground/50 hover:text-foreground hover:border-border transition-colors"
+          title="Import project from ZIP"
+        >
+          <UploadCloud className="w-3 h-3" />
+          Import ZIP
         </button>
       </div>
 
@@ -353,6 +560,12 @@ export function FileExplorer({
                 onRenameNode={onRenameNode}
                 onAddFile={onAddFile}
                 nodeIndex={idx + 1}
+                draggedId={draggedId}
+                dropTargetId={dropTargetId}
+                onDragStart={handleInternalDragStart}
+                onDragOver={handleInternalDragOver}
+                onDrop={handleInternalDrop}
+                onDragEnd={handleDragEnd}
               />
             ))
           )}
@@ -361,7 +574,7 @@ export function FileExplorer({
 
       <div className="px-3 py-2 border-t border-border">
         <p className="text-[9px] text-muted-foreground/30 code-font text-center">
-          Double-click to rename
+          Double-click to rename · Drag to reorder
         </p>
       </div>
     </div>

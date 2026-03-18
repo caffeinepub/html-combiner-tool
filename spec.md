@@ -1,39 +1,26 @@
 # HTML Combiner Tool
 
 ## Current State
-Simple two-column layout: left side has three stacked CodePanels (HTML, CSS, JS) each with file upload and scratch pad textarea. Right side shows combined output with Code/Preview tabs. No folder support, no file tree, no IDE-style UI.
+The app combines HTML/CSS/JS files using a synchronous `combineHTML()` function called directly on the main thread. Live preview uses a fixed 600ms debounce. Every combine re-parses all HTML files via `DOMParser` regardless of changes. No loading indicator is shown during combine.
 
 ## Requested Changes (Diff)
 
 ### Add
-- Left sidebar file explorer (like Tynker/VSCode): collapsible folder tree
-- Ability to create folders and nest files inside them
-- Add new file buttons for HTML, CSS, and JS from the sidebar
-- Rename and delete files/folders via context menu or inline controls
-- Active file tab system: clicking a file in the sidebar opens it in a code editor tab in the main panel
-- Multiple open file tabs at top of editor area (closable)
-- Syntax-highlighted editor area (use a textarea with monospace styling — no external editor lib needed)
-- Status bar at bottom showing file count, active file type, line count
-- Professional dark IDE theme throughout
+- Web Worker (`combineWorker.ts`) that runs `combineHTML` off the main thread
+- Parse cache (Map keyed by file content hash) to skip re-parsing unchanged HTML files
+- Adaptive debounce: delay scales with total content size (300ms <50KB, 600ms 50-200KB, 1200ms >200KB)
+- Loading spinner/indicator in the output area while a worker combine is in-flight
 
 ### Modify
-- Replace split-panel layout with IDE layout: narrow sidebar + wide editor area + output panel
-- Output panel becomes a right-side split or bottom panel (resizable hint via layout)
-- Header redesigned to look like a professional IDE toolbar with project name, combine/run button, download
-- Remove the "scratch pad" concept — all editing happens in files
-- File type is inferred from extension, not from separate panels
+- `App.tsx`: replace synchronous `combineHTML()` call with async Web Worker message; update live-preview debounce to use adaptive delay
+- `combineHTML.ts`: expose cached `parsePage` using a module-level Map; accept optional cache from worker context
+- `OutputPanel.tsx`: show a loading overlay/spinner when `isCombining` prop is true
 
 ### Remove
-- Three stacked CodePanels (HTML/CSS/JS)
-- Scratch pad textareas
-- Old two-column layout
+- Direct main-thread call to `combineHTML` in `buildCombined`
 
 ## Implementation Plan
-1. Define data types: FileNode (id, name, type: 'file'|'folder', language, content, parentId)
-2. Build FileTree sidebar component with folder expand/collapse, file selection, add file/folder buttons, rename, delete
-3. Build EditorArea component: open tabs bar + active file textarea editor
-4. Build OutputPanel component with Code/Preview tabs, copy/download actions
-5. Wire combine logic: collect all files by type, run existing combineHTML utility
-6. Build StatusBar at bottom
-7. Compose IDE layout: sidebar | editor | output in App.tsx
-8. Apply professional dark IDE theme
+1. Create `src/frontend/src/workers/combineWorker.ts` -- imports combineHTML, listens for messages, posts result back
+2. Modify `combineHTML.ts` to use a module-level parse cache keyed by `name+content` hash
+3. Update `App.tsx` -- instantiate worker once via `useRef`, send files via `postMessage`, receive result in `onmessage`, compute adaptive debounce delay from total byte size
+4. Update `OutputPanel.tsx` -- add `isCombining?: boolean` prop, show spinner overlay on the code/preview panels

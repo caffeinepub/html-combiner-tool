@@ -1,5 +1,6 @@
 import { EditorArea } from "@/components/EditorArea";
 import { FileExplorer } from "@/components/FileExplorer";
+import type { ConsoleLog } from "@/components/OutputPanel";
 import { OutputPanel } from "@/components/OutputPanel";
 import { Toaster } from "@/components/ui/sonner";
 import {
@@ -8,13 +9,35 @@ import {
   type FileNode,
   getDefaultContent,
 } from "@/types/fileTree";
-import { type SourceFile, combineHTML } from "@/utils/combineHTML";
+import type { SourceFile } from "@/utils/combineHTML";
+import { detectConflicts } from "@/utils/detectConflicts";
+import { validateHTML } from "@/utils/validateHTML";
+import { exportProjectZip, importProjectZip } from "@/utils/zipUtils";
 import { Combine, Download, Play } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+
+// ── Web Worker ────────────────────────────────────────────────────────────
+// Import Vite-bundled worker
+import CombineWorker from "@/workers/combineWorker?worker";
 
 function generateId(prefix = "node"): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function nowTimeString(): string {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+}
+
+/** Adaptive debounce: scale delay by total content size */
+function adaptiveDelay(files: FileNode[]): number {
+  const totalBytes = files
+    .filter((f) => f.type === "file")
+    .reduce((sum, f) => sum + (f.content?.length ?? 0), 0);
+  if (totalBytes < 50_000) return 300;
+  if (totalBytes < 200_000) return 600;
+  return 1200;
 }
 
 export default function App() {
@@ -28,8 +51,142 @@ export default function App() {
   const [projectName, setProjectName] = useState("My Project");
   const [isEditingName, setIsEditingName] = useState(false);
   const [statusMsg, setStatusMsg] = useState("Ready");
+  const [isEditorDragging, setIsEditorDragging] = useState(false);
   const projectNameRef = useRef<HTMLInputElement>(null);
 
+  // ── Feature state ──────────────────────────────────────────────────────────
+  const [conflictDetectorEnabled, setConflictDetectorEnabled] = useState(true);
+  const [conflictsDismissed, setConflictsDismissed] = useState(false);
+  const [conflicts, setConflicts] = useState<{
+    cssConflicts: string[];
+    jsConflicts: string[];
+  } | null>(null);
+  const [isLivePreview, setIsLivePreview] = useState(false);
+  const [isLiveBuilding, setIsLiveBuilding] = useState(false);
+  const [isMinified, setIsMinified] = useState(false);
+  const [consoleLogs, setConsoleLogs] = useState<ConsoleLog[]>([]);
+  const [validationIssues, setValidationIssues] = useState<string[]>([]);
+  const [activeOutputTab, setActiveOutputTab] = useState("code");
+
+  const livePreviewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  // ── Web Worker setup ──────────────────────────────────────────────────────
+  const workerRef = useRef<Worker | null>(null);
+  const pendingRequestIdRef = useRef(0);
+  const latestRequestIdRef = useRef(0);
+
+  useEffect(() => {
+    const worker = new CombineWorker();
+    workerRef.current = worker;
+    return () => worker.terminate();
+  }, []);
+
+  // ── Core: build combined HTML via worker ─────────────────────────────
+  const buildCombined = useCallback(
+    (silent = false) => {
+      const worker = workerRef.current;
+      if (!worker) return;
+
+      const allFileNodes = files.filter((f) => f.type === "file");
+      const htmlFiles: SourceFile[] = allFileNodes
+        .filter((f) => f.language === "html")
+        .map((f) => ({ name: f.name, content: f.content ?? "" }));
+      const cssFiles: SourceFile[] = allFileNodes
+        .filter((f) => f.language === "css")
+        .map((f) => ({ name: f.name, content: f.content ?? "" }));
+      const jsFiles: SourceFile[] = allFileNodes
+        .filter((f) => f.language === "js")
+        .map((f) => ({ name: f.name, content: f.content ?? "" }));
+
+      const requestId = ++pendingRequestIdRef.current;
+      latestRequestIdRef.current = requestId;
+
+      setIsLiveBuilding(true);
+
+      // Handle response
+      const handleResult = (e: MessageEvent) => {
+        // Ignore stale responses (user triggered a newer combine)
+        if (e.data?.requestId !== latestRequestIdRef.current) return;
+
+        worker.removeEventListener("message", handleResult);
+        const result: string = e.data.result;
+
+        // Validation (fast, stays on main thread)
+        const issues = validateHTML(result);
+        setValidationIssues(issues);
+
+        // Conflict detection
+        if (conflictDetectorEnabled) {
+          const detected = detectConflicts(
+            cssFiles.map((f) => f.content),
+            jsFiles.map((f) => f.content),
+          );
+          setConflicts(detected);
+          setConflictsDismissed(false);
+        }
+
+        setOutput(result);
+        setHasGenerated(true);
+        setIsLiveBuilding(false);
+
+        const lineCount = result.split("\n").length;
+        setStatusMsg(`Combined — ${lineCount} lines`);
+
+        if (!silent) setActiveOutputTab("preview");
+      };
+
+      worker.addEventListener("message", handleResult);
+      worker.postMessage({ requestId, htmlFiles, cssFiles, jsFiles });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [files, conflictDetectorEnabled],
+  );
+
+  const handleCombine = useCallback(() => {
+    buildCombined(false);
+  }, [buildCombined]);
+
+  // ── Live preview debounce (adaptive delay) ───────────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: livePreviewTimerRef is a stable ref
+  useEffect(() => {
+    if (!isLivePreview) return;
+    if (livePreviewTimerRef.current) clearTimeout(livePreviewTimerRef.current);
+    const delay = adaptiveDelay(files);
+    livePreviewTimerRef.current = setTimeout(() => {
+      buildCombined(true);
+      setActiveOutputTab("preview");
+    }, delay);
+    return () => {
+      if (livePreviewTimerRef.current)
+        clearTimeout(livePreviewTimerRef.current);
+    };
+  }, [files, isLivePreview, buildCombined]);
+
+  // ── Console log listener ──────────────────────────────────────────────
+  useEffect(() => {
+    function handleMessage(e: MessageEvent) {
+      if (
+        e.data?.type === "console" &&
+        ["log", "warn", "error"].includes(e.data.level)
+      ) {
+        setConsoleLogs((prev) => [
+          ...prev,
+          {
+            id: `log-${Date.now()}-${Math.random()}`,
+            level: e.data.level as ConsoleLog["level"],
+            args: e.data.args as string[],
+            time: nowTimeString(),
+          },
+        ]);
+      }
+    }
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, []);
+
+  // ── File management ────────────────────────────────────────────────────────
   const handleFileClick = useCallback((id: string) => {
     setOpenTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
     setActiveTabId(id);
@@ -126,26 +283,99 @@ export default function App() {
     [files],
   );
 
-  const handleCombine = useCallback(() => {
-    const allFileNodes = files.filter((f) => f.type === "file");
-    const htmlFiles: SourceFile[] = allFileNodes
-      .filter((f) => f.language === "html")
-      .map((f) => ({ name: f.name, content: f.content ?? "" }));
-    const cssFiles: SourceFile[] = allFileNodes
-      .filter((f) => f.language === "css")
-      .map((f) => ({ name: f.name, content: f.content ?? "" }));
-    const jsFiles: SourceFile[] = allFileNodes
-      .filter((f) => f.language === "js")
-      .map((f) => ({ name: f.name, content: f.content ?? "" }));
-    const result = combineHTML(htmlFiles, cssFiles, jsFiles);
-    setOutput(result);
-    setHasGenerated(true);
-    const lineCount = result.split("\n").length;
-    setStatusMsg(`Combined \u2014 ${lineCount} lines`);
-    toast.success("Combined successfully!", {
-      description: `${lineCount} lines from ${allFileNodes.length} files`,
-    });
-  }, [files]);
+  const handleUploadFiles = useCallback((fileList: FileList) => {
+    const items = Array.from(fileList);
+    const newNodes: FileNode[] = [];
+    let pending = items.length;
+    for (const file of items) {
+      const ext = file.name.split(".").pop()?.toLowerCase();
+      const language: FileLanguage =
+        ext === "css" ? "css" : ext === "js" ? "js" : "html";
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const content = (e.target?.result as string) ?? "";
+        const id = generateId("file");
+        newNodes.push({
+          id,
+          name: file.name,
+          type: "file",
+          language,
+          content,
+          parentId: null,
+          order: Date.now(),
+        });
+        pending--;
+        if (pending === 0) {
+          setFiles((prev) => [...prev, ...newNodes]);
+          setOpenTabs((prev) => [...prev, ...newNodes.map((n) => n.id)]);
+          setActiveTabId(newNodes[newNodes.length - 1].id);
+          setStatusMsg(`Uploaded ${newNodes.length} file(s)`);
+          toast.success(`Uploaded ${newNodes.length} file(s)`);
+        }
+      };
+      reader.readAsText(file);
+    }
+  }, []);
+
+  const handleReorderNodes = useCallback(
+    (draggedId: string, targetId: string) => {
+      setFiles((prev) => {
+        const dragged = prev.find((f) => f.id === draggedId);
+        const target = prev.find((f) => f.id === targetId);
+        if (!dragged || !target || dragged.parentId !== target.parentId)
+          return prev;
+
+        const siblings = prev
+          .filter((f) => f.parentId === dragged.parentId)
+          .sort((a, b) => a.order - b.order);
+
+        const fromIdx = siblings.findIndex((f) => f.id === draggedId);
+        const toIdx = siblings.findIndex((f) => f.id === targetId);
+        if (fromIdx === -1 || toIdx === -1) return prev;
+
+        const reordered = [...siblings];
+        const [removed] = reordered.splice(fromIdx, 1);
+        reordered.splice(toIdx, 0, removed);
+
+        const orderMap = new Map(reordered.map((f, i) => [f.id, i]));
+        return prev.map((f) =>
+          orderMap.has(f.id) ? { ...f, order: orderMap.get(f.id)! } : f,
+        );
+      });
+      setStatusMsg("Reordered");
+    },
+    [],
+  );
+
+  const handleExportZip = useCallback(async () => {
+    try {
+      await exportProjectZip(files, projectName);
+      toast.success("Project exported as ZIP!");
+    } catch (e) {
+      toast.error(`Export failed: ${String(e)}`);
+    }
+  }, [files, projectName]);
+
+  const handleImportZip = useCallback(async (file: File) => {
+    try {
+      const { nodes, openIds, activeId } = await importProjectZip(file);
+      if (nodes.length === 0) {
+        toast.error("No .html/.css/.js files found in ZIP.");
+        return;
+      }
+      setFiles((prev) => [...prev, ...nodes]);
+      setOpenTabs((prev) => [...prev, ...openIds]);
+      if (activeId) setActiveTabId(activeId);
+      setStatusMsg(
+        `Imported ${nodes.filter((n) => n.type === "file").length} file(s) from ZIP`,
+      );
+      toast.success(
+        `Imported ${nodes.filter((n) => n.type === "file").length} file(s) from ZIP!`,
+      );
+    } catch (e) {
+      toast.error(`Import failed: ${String(e)}`);
+    }
+  }, []);
 
   const handleDownload = useCallback(() => {
     if (!output) return;
@@ -162,20 +392,36 @@ export default function App() {
   const fileCount = files.filter((f) => f.type === "file").length;
   const activeFile = files.find((f) => f.id === activeTabId);
 
+  const handleEditorDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsEditorDragging(true);
+  };
+
+  const handleEditorDragLeave = (e: React.DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsEditorDragging(false);
+    }
+  };
+
+  const handleEditorDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsEditorDragging(false);
+    if (e.dataTransfer.files.length > 0) {
+      handleUploadFiles(e.dataTransfer.files);
+    }
+  };
+
   return (
     <div className="h-screen flex flex-col overflow-hidden bg-background text-foreground">
       <Toaster theme="dark" position="bottom-right" />
 
-      {/* ── Header ────────────────────────────────────────────────────────── */}
-      {/* Uses ide-header (0.115) — sits between sidebar (0.145) and tabbar (0.10) */}
-      {/* Top accent stripe marks the app boundary cleanly */}
+      {/* ── Header ────────────────────────────────────────────────────────────────── */}
       <header
         className="ide-header border-b border-border flex items-center h-12 px-4 shrink-0 gap-3 z-20"
         style={{ borderTop: "2px solid oklch(0.76 0.14 190 / 0.45)" }}
       >
-        {/* Logo mark + wordmark */}
+        {/* Logo */}
         <div className="flex items-center gap-2.5 shrink-0">
-          {/* Gradient logo mark — distinctive, not a generic icon-in-a-box */}
           <div
             className="w-7 h-7 rounded-md flex items-center justify-center shrink-0"
             style={{
@@ -196,7 +442,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Divider */}
         <div className="w-px h-5 bg-border/70 shrink-0" />
 
         {/* Editable project name */}
@@ -228,7 +473,7 @@ export default function App() {
 
         <div className="flex-1" />
 
-        {/* Download — ghost style, only when output exists */}
+        {/* Download */}
         {hasGenerated && (
           <button
             type="button"
@@ -241,22 +486,23 @@ export default function App() {
           </button>
         )}
 
-        {/* Primary CTA — full glow treatment */}
+        {/* Primary CTA */}
         <button
           type="button"
           data-ocid="combine.primary_button"
           onClick={handleCombine}
-          className="btn-glow flex items-center gap-2 px-4 h-8 rounded text-xs font-semibold bg-primary text-primary-foreground transition-all duration-150 code-font"
+          disabled={isLiveBuilding}
+          className="btn-glow flex items-center gap-2 px-4 h-8 rounded text-xs font-semibold bg-primary text-primary-foreground transition-all duration-150 code-font disabled:opacity-60"
         >
           <Play className="w-3.5 h-3.5" />
-          Combine &amp; Preview
+          {isLiveBuilding ? "Combining…" : "Combine & Preview"}
         </button>
       </header>
 
-      {/* ── Main panels ───────────────────────────────────────────────────── */}
+      {/* ── Main panels ─────────────────────────────────────────────────────────────── */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar — lightest panel (0.145) */}
-        <div className="w-[220px] shrink-0 overflow-hidden">
+        {/* Sidebar */}
+        <div className="w-[220px] shrink-0 overflow-hidden relative">
           <FileExplorer
             files={files}
             activeFileId={activeTabId}
@@ -266,11 +512,41 @@ export default function App() {
             onRenameNode={handleRenameNode}
             onAddFile={handleAddFile}
             onAddFolder={handleAddFolder}
+            onUploadFiles={handleUploadFiles}
+            onReorderNodes={handleReorderNodes}
+            onExportZip={handleExportZip}
+            onImportZip={handleImportZip}
           />
         </div>
 
-        {/* Editor — darkest panel (0.07), slight inset shadow on left edge */}
-        <div className="flex-1 overflow-hidden ide-panel panel-inset">
+        {/* Editor */}
+        <div
+          className={`flex-1 overflow-hidden ide-panel panel-inset relative transition-all duration-150 ${
+            isEditorDragging ? "ring-1 ring-inset ring-primary/30" : ""
+          }`}
+          onDragOver={handleEditorDragOver}
+          onDragLeave={handleEditorDragLeave}
+          onDrop={handleEditorDrop}
+        >
+          {isEditorDragging && (
+            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-primary/5 border-2 border-dashed border-primary/40 pointer-events-none">
+              <div
+                className="w-10 h-10 rounded-full flex items-center justify-center mb-2"
+                style={{
+                  background:
+                    "linear-gradient(135deg, oklch(0.76 0.14 190 / 0.2), oklch(0.60 0.18 230 / 0.2))",
+                }}
+              >
+                <Combine className="w-5 h-5 text-primary/60" />
+              </div>
+              <p className="text-sm text-primary/70 code-font font-medium">
+                Drop .html / .css / .js files
+              </p>
+              <p className="text-xs text-muted-foreground/50 code-font mt-1">
+                Files will be added to the explorer
+              </p>
+            </div>
+          )}
           <EditorArea
             files={files}
             openTabs={openTabs}
@@ -281,15 +557,35 @@ export default function App() {
           />
         </div>
 
-        {/* Output — same depth as sidebar (0.145) */}
+        {/* Output */}
         <div className="w-[380px] shrink-0 overflow-hidden">
-          <OutputPanel output={output} hasGenerated={hasGenerated} />
+          <OutputPanel
+            output={output}
+            hasGenerated={hasGenerated}
+            isMinified={isMinified}
+            onToggleMinify={() => setIsMinified((p) => !p)}
+            conflicts={conflicts}
+            conflictsDismissed={conflictsDismissed}
+            onDismissConflicts={() => setConflictsDismissed(true)}
+            conflictDetectorEnabled={conflictDetectorEnabled}
+            onToggleConflictDetector={() =>
+              setConflictDetectorEnabled((p) => !p)
+            }
+            isLivePreview={isLivePreview}
+            onToggleLivePreview={() => setIsLivePreview((p) => !p)}
+            isLiveBuilding={isLiveBuilding}
+            consoleLogs={consoleLogs}
+            onClearConsoleLogs={() => setConsoleLogs([])}
+            validationIssues={validationIssues}
+            activeOutputTab={activeOutputTab}
+            onActiveOutputTabChange={setActiveOutputTab}
+            onOutputChange={setOutput}
+          />
         </div>
       </div>
 
-      {/* ── Status Bar ────────────────────────────────────────────────────── */}
+      {/* ── Status Bar ────────────────────────────────────────────────────────────────── */}
       <footer className="ide-statusbar border-t border-border/80 h-[22px] flex items-center px-3 gap-3 shrink-0">
-        {/* Language pill — colored, anchored left */}
         {activeFile?.language && (
           <span
             className={`text-[9px] font-bold uppercase px-1.5 py-px rounded code-font ${
@@ -312,25 +608,33 @@ export default function App() {
           {fileCount} file{fileCount !== 1 ? "s" : ""}
         </span>
 
-        <div className="flex-1" />
+        {isLivePreview && (
+          <span className="text-[9px] px-1.5 py-px rounded code-font font-bold bg-primary/15 text-primary/70">
+            LIVE
+          </span>
+        )}
 
-        <span className="text-[10px] text-muted-foreground/45 code-font">
+        {isLiveBuilding && (
+          <span className="text-[9px] px-1.5 py-px rounded code-font font-bold bg-amber-500/15 text-amber-400/80 animate-pulse">
+            COMBINING…
+          </span>
+        )}
+
+        <div className="flex-1" />
+        <span className="text-[10px] text-muted-foreground/30 code-font">
           {statusMsg}
         </span>
-
-        <div className="w-px h-3 bg-border/50" />
-
-        <span className="text-[10px] text-muted-foreground/30 code-font">
-          © {new Date().getFullYear()}{" "}
-          <a
-            href={`https://caffeine.ai?utm_source=caffeine-footer&utm_medium=referral&utm_content=${encodeURIComponent(window.location.hostname)}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-primary/60 transition-colors"
-          >
-            caffeine.ai
-          </a>
+        <span className="text-[10px] text-muted-foreground/20 code-font">
+          •
         </span>
+        <a
+          href="https://caffeine.ai"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hover:text-primary/60 transition-colors"
+        >
+          caffeine.ai
+        </a>
       </footer>
     </div>
   );
